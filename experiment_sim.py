@@ -6,29 +6,34 @@ from multiprocessing import Pool
 from functools import partial
 
 from ada import *
-from knn import *
+from classifiers import *
 
 
 def generate_genephys(spontaneous, evoked):
     import genephys.sampler as sample_data
 
+    # Data dimensions
     n_t = 100
     n_chan = len(evoked['CHAN_PROB'])
     n_trial = 200
     n_cond = 2
 
+    # Train split
     ds = sample_data.DataSampler(n_t, n_chan, n_cond, spontaneous, evoked)
     x, _, _, _, _, _, stimulus = ds.sample(n_trial)
     y = 2 * stimulus[10] - 3
 
+    # Sort trials by label
     sorted_ixs = np.argsort(y)
     y = y[sorted_ixs]
     x = x[:, sorted_ixs]
 
+    # Test split
     ds_test = sample_data.DataSampler(n_t, n_chan, n_cond, spontaneous, evoked)
     x_test, _, _, _, _, _, stimulus_test = ds_test.sample(n_trial)
     y_test = 2 * stimulus_test[10] - 3
 
+    # Sort
     sorted_ixs_test = np.argsort(y_test)
     y_test = y_test[sorted_ixs_test]
     x_test = x_test[:, sorted_ixs_test]
@@ -36,13 +41,15 @@ def generate_genephys(spontaneous, evoked):
     return x, y, x_test, y_test
 
 
-def experiment(exp_type, exp_params, n_rep=20, n_chan=40):
+def experiment(exp_type, exp_params, n_perm=100, n_chan=40):
     import math
 
+    # Channel relevance prior
     c_prob = .9
     c_relev = 20
     chan_prob = np.array([c_prob]*c_relev + [0]*(n_chan-c_relev))
 
+    # Base algorithm configuration
     cfg_algo = {
         'K': 20,
         'L': 30,
@@ -53,6 +60,7 @@ def experiment(exp_type, exp_params, n_rep=20, n_chan=40):
         'prediction2': 'Regression'
     }
 
+    # Background process configuration
     spontaneous = {
         "FREQ_RANGE": [.01, math.pi/4],
         "AMP_RANGE": [.5, 2],
@@ -61,6 +69,7 @@ def experiment(exp_type, exp_params, n_rep=20, n_chan=40):
         "MEASUREMENT_NOISE": .5
     }
 
+    # Evoked process configuration
     evoked = {
         "phase_reset": False,
         "amplitude_modulation": False,
@@ -75,19 +84,22 @@ def experiment(exp_type, exp_params, n_rep=20, n_chan=40):
         'DELAY_ABSOLUTE_JITTER': 20
     }
 
+    # Initialize output
     out_dict = {
         'cfg_algo': cfg_algo,
-        'evoked': evoked
+        'evoked': evoked,
+        'manipulations': exp_params,
+        'results': {}
     }
 
     exp_label, overrides = exp_params
-
     n_conds = len(overrides)
 
-    acc = np.zeros((n_rep, n_conds, 4))
     for i, cond in enumerate(overrides):
         print(f'computing condition {i}/{n_conds}')
+        out_dict['results'][cond] = {}
 
+        # Update config with experiment parameters
         if exp_type == 'signal':
             if exp_label == 'DELAY_ABSOLUTE_JITTER':
                 param = cond
@@ -104,25 +116,44 @@ def experiment(exp_type, exp_params, n_rep=20, n_chan=40):
         else:
             cfg_i = cfg_algo
 
-        for r in range(n_rep):
-            X, y, Xtest, ytest = generate_genephys(spontaneous, evoked_i)
+        for p in range(n_perm):
+            x_train, y_train, x_test, y_test = generate_genephys(spontaneous, evoked_i)
 
-            yhat_ada, yhat_win_test, betas, theta, Htrain, Htest = ada(X, None, y, Xtest, None, cfg_i)
-            acc_ada = np.mean(ytest == yhat_ada)
+            # ADA with multiple base classifiers
+            ada_out = {}
+            for clf in ['knn', 'svm', 'lda']:
+                cfg_ada = {**cfg_algo, 'clf_kind':clf}
+                ada_out[clf] = ada(x_train, None, y_train, x_test, None, cfg_ada)
 
-            yhat_cknn = knn(X, y, Xtest, cfg_i)
-            acc_cknn = 0
-            for jj in range(1, yhat_cknn.shape[1]):
-                acc_cknn = max(acc_cknn, np.mean(ytest == yhat_cknn[:, jj]))
+            # KNN
+            yhat_knn = knn(x_train, y_train, x_test, cfg_algo)
+            acc_knn = np.zeros(yhat_knn.shape[1])
+            for jj in range(yhat_knn.shape[1]):
+                acc_knn[jj] = np.mean(y_test == yhat_knn[:, jj])
+                
 
-            cfg_i['method'] = 'average'
-            yhat_wknn_avg, _, _ = w_knn(X, y, Xtest, cfg_i)
-            acc_wknn_avg = np.mean(ytest == yhat_wknn_avg)
+            # SVM
+            yhat_svm = svm(x_train, y_train, x_test, cfg_algo)
+            acc_svm = np.zeros(yhat_svm.shape[1])
+            for jj in range(yhat_svm.shape[1]):
+                acc_svm[jj] = np.mean(y_test == yhat_svm[:, jj])
 
-            acc[r,i,:] = [acc_ada, acc_cknn, acc_wknn_avg]
-
-    out_dict['acc'] = acc
-    out_dict['manipulations'] = exp_params
+            # LDA
+            yhat_lda = lda(x_train, y_train, x_test, cfg_algo)
+            acc_lda = np.zeros(yhat_lda.shape[1])
+            for jj in range(yhat_lda.shape[1]):
+                acc_lda[jj] = np.mean(y_test == yhat_lda[:, jj])
+        
+            # Store results
+            out_dict['results'][cond][p] = {
+                                                'cond_idx': i,
+                                                'cond': cond,
+                                                'iteration': p,
+                                                'ada': ada_out,
+                                                'knn': acc_knn,
+                                                'svm': acc_svm,
+                                                'lda': acc_lda
+                                            }
 
     return out_dict
 
@@ -135,10 +166,10 @@ def run_experiment():
         ('CHAN_PROB', np.arange(0,31,3))
         ]
 
-    run_experiment_partial = partial(experiment)
+    run_experiment_partial = partial(experiment, 'signal')
 
     with Pool(processes=len(experiments)) as pool:
-        results = pool.map(run_experiment_partial, 'signal', experiments)
+        results = pool.map(run_experiment_partial, experiments)
 
     return results
 
